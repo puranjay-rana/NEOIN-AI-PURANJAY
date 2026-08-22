@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>AI Mock Interview</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; }
+  textarea { width: 100%; min-height: 90px; margin-bottom: 8px; font-family: inherit; }
+  video { width: 100%; max-width: 480px; border-radius: 8px; background: #000; display: block; margin: 12px 0; }
+  button { padding: 10px 18px; font-size: 1rem; border-radius: 6px; border: 1px solid #333; background: #1a1a1a; color: #fff; cursor: pointer; margin-right: 8px; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #question-box { font-size: 1.15rem; font-weight: 600; margin: 16px 0 8px; min-height: 2.5em; }
+  #status { color: #666; margin-bottom: 8px; }
+  #report { white-space: pre-wrap; background: #f5f5f5; padding: 16px; border-radius: 8px; margin-top: 16px; font-family: monospace; font-size: 0.85rem; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+
+<h1>🎤 AI Mock Interview (live)</h1>
+
+<div id="setup">
+  <label>Resume text</label>
+  <textarea id="resume_text">Jane Doe - Backend Engineer
+3 years experience with Python, FastAPI, PostgreSQL, Docker, and AWS.
+Built microservices for a fintech payments platform.</textarea>
+
+  <label>Job description</label>
+  <textarea id="job_description">We are hiring a Backend Engineer with strong Python,
+distributed systems, and cloud (AWS) experience. Bonus: Kafka, Kubernetes.</textarea>
+
+  <button id="start-btn">Start Interview</button>
+</div>
+
+<div id="interview" class="hidden">
+  <video id="preview" autoplay muted playsinline></video>
+  <div id="status">Connecting...</div>
+  <div id="question-box"></div>
+  <button id="record-btn" disabled>🔴 Start Answer</button>
+  <button id="submit-btn" disabled>✅ Submit Answer</button>
+</div>
+
+<div id="report" class="hidden"></div>
+
+<script>
+let ws;
+let mediaStream;
+let mediaRecorder;
+let audioChunks = [];
+let frameCaptures = [];
+let frameIntervalId;
+
+const startBtn = document.getElementById("start-btn");
+const recordBtn = document.getElementById("record-btn");
+const submitBtn = document.getElementById("submit-btn");
+const statusEl = document.getElementById("status");
+const questionBox = document.getElementById("question-box");
+const reportEl = document.getElementById("report");
+const preview = document.getElementById("preview");
+
+function speak(text) {
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.rate = 1.0;
+  window.speechSynthesis.speak(utter);
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result.split(",")[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+function captureFrame() {
+  const canvas = document.createElement("canvas");
+  canvas.width = preview.videoWidth || 320;
+  canvas.height = preview.videoHeight || 240;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(preview, 0, 0, canvas.width, canvas.height);
+  frameCaptures.push(canvas.toDataURL("image/jpeg", 0.6).split(",")[1]);
+}
+
+async function initMedia() {
+  mediaStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  preview.srcObject = mediaStream;
+}
+
+function connectWs() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws/interview`);
+
+  ws.onopen = () => {
+    statusEl.textContent = "Connected. Starting interview...";
+    ws.send(JSON.stringify({
+      action: "start",
+      resume_text: document.getElementById("resume_text").value,
+      job_description: document.getElementById("job_description").value,
+    }));
+  };
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === "question") {
+      statusEl.textContent = "Listen to the question, then answer.";
+      questionBox.textContent = msg.question;
+      speak(msg.question);
+      recordBtn.disabled = false;
+      submitBtn.disabled = true;
+    } else if (msg.type === "final") {
+      document.getElementById("interview").classList.add("hidden");
+      reportEl.classList.remove("hidden");
+      reportEl.textContent = msg.report;
+      speak("That concludes the interview. Your report is ready.");
+    } else if (msg.type === "error") {
+      statusEl.textContent = "Error: " + msg.message;
+    }
+  };
+
+  ws.onerror = () => { statusEl.textContent = "WebSocket error — is the server running?"; };
+  ws.onclose = () => { statusEl.textContent = "Disconnected."; };
+}
+
+startBtn.addEventListener("click", async () => {
+  document.getElementById("setup").classList.add("hidden");
+  document.getElementById("interview").classList.remove("hidden");
+  await initMedia();
+  connectWs();
+});
+
+recordBtn.addEventListener("click", () => {
+  audioChunks = [];
+  frameCaptures = [];
+  mediaRecorder = new MediaRecorder(mediaStream, { mimeType: "audio/webm" });
+  mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
+  mediaRecorder.start();
+
+  frameIntervalId = setInterval(captureFrame, 1000); // 1 frame/sec
+
+  recordBtn.disabled = true;
+  submitBtn.disabled = false;
+  statusEl.textContent = "Recording your answer...";
+});
+
+submitBtn.addEventListener("click", async () => {
+  submitBtn.disabled = true;
+  statusEl.textContent = "Submitting answer...";
+
+  clearInterval(frameIntervalId);
+  mediaRecorder.stop();
+
+  mediaRecorder.onstop = async () => {
+    const audioBlob = new Blob(audioChunks, { type: "audio/webm" });
+    const audioB64 = await blobToBase64(audioBlob);
+
+    ws.send(JSON.stringify({
+      action: "answer",
+      audio_b64: audioB64,
+      frames_b64: frameCaptures,
+    }));
+
+    questionBox.textContent = "";
+    statusEl.textContent = "Waiting for next question...";
+  };
+});
+</script>
+
+</body>
+</html>

@@ -1,0 +1,36 @@
+# --- web app (live interview) ---
+fastapi
+uvicorn[standard]
+python-multipart
+
+# --- core agent / graph / LLM ---
+langchain
+langchain-core
+langgraph
+langchain-google-genai   # if LLM_PROVIDER=google
+langchain-openai         # if LLM_PROVIDER=openai
+python-dotenv
+
+# --- RAG ---
+langchain-text-splitters
+langchain-community
+langchain-chroma
+chromadb
+
+# --- video analysis: audio ---
+openai-whisper
+spacy                    # run: python -m spacy download en_core_web_sm
+textstat
+librosa
+numpy
+
+opencv-python<5
+moviepy
+tqdm
+
+# --- optional, better vision quality (see README note) ---
+mediapipe
+# deepface
+deepface
+pdfplumber
+mysql-connector-python
