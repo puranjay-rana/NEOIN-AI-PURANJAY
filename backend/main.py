@@ -1,23 +1,24 @@
-
-
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import os
+import socket
 import traceback
 import uuid
-from typing import Dict, List, Any
+from typing import Dict, List
 
 import pdfplumber
-import cv2
 import mysql.connector
+import edge_tts
 
 from fastapi import (
     FastAPI,
     File,
     HTTPException,
+    Response,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
@@ -39,14 +40,136 @@ from src.db import init_db, save_interview
 
 
 # ============================================================
+# TEXT-TO-SPEECH (edge-tts -- free access to Azure's Neural voices,
+# no API key or account needed)
+# ============================================================
+
+# Maps our frontend's BCP-47 language codes to a specific Azure Neural
+# voice name. edge-tts exposes Microsoft Edge's online read-aloud
+# service, which uses the same Neural voice catalog as paid Azure
+# Cognitive Speech -- meaning these sound dramatically more natural than
+# gTTS, and cover languages (like Odia) that gTTS doesn't support at all.
+EDGE_TTS_VOICE_MAP = {
+    "en-US": "en-US-AriaNeural",
+    "hi-IN": "hi-IN-SwaraNeural",
+    "es-ES": "es-ES-ElviraNeural",
+    "fr-FR": "fr-FR-DeniseNeural",
+    "de-DE": "de-DE-KatjaNeural",
+    "zh-CN": "zh-CN-XiaoxiaoNeural",
+    "ja-JP": "ja-JP-NanamiNeural",
+    "ar-SA": "ar-SA-ZariyahNeural",
+    "pt-BR": "pt-BR-FranciscaNeural",
+    "ru-RU": "ru-RU-SvetlanaNeural",
+    "ta-IN": "ta-IN-PallaviNeural",
+    "te-IN": "te-IN-ShrutiNeural",
+    "kn-IN": "kn-IN-SapnaNeural",
+    "bn-IN": "bn-IN-TanishaaNeural",
+    "or-IN": "or-IN-SubhasiniNeural",
+}
+
+
+def _is_dns_failure(exc: Exception) -> bool:
+    """True if `exc` looks like a DNS/network-unreachable failure rather
+    than a transient handshake blip. edge-tts calls out to
+    speech.platform.bing.com over the network; if DNS can't resolve that
+    host at all (aiohttp.ClientConnectorDNSError wrapping a
+    socket.gaierror), retrying half a second later will fail again for
+    the exact same reason -- it just adds latency and makes it more
+    likely the client gives up waiting. Fail fast instead."""
+    if isinstance(exc, socket.gaierror):
+        return True
+    cause = exc.__cause__
+    if isinstance(cause, socket.gaierror):
+        return True
+    return "DNSError" in type(exc).__name__ or "getaddrinfo failed" in str(exc)
+
+
+async def synthesize_question_audio(text: str, language_code: str) -> str:
+    """Generates MP3 speech for `text` in the given language via edge-tts
+    and returns it as a base64 string. Returns "" on any failure -- this
+    calls out to Microsoft's online service over the network, so an
+    outage (or an unmapped language_code / unsupported voice) must never
+    block the interview; the frontend falls back to the browser's
+    built-in speechSynthesis voice whenever audio_b64 comes back empty.
+
+    Retries once with a short backoff for transient handshake failures
+    (edge-tts, an unofficial client of Microsoft's Edge read-aloud
+    service, occasionally drops the websocket mid-handshake even for a
+    valid voice). But if the failure is a DNS/network-unreachable error,
+    we skip the retry and fail immediately -- that kind of failure won't
+    resolve itself in 0.5 seconds, and retrying just delays the fallback
+    response to the client.
+    """
+    if not text or not text.strip():
+        return ""
+
+    voice = EDGE_TTS_VOICE_MAP.get(language_code, "en-US-AriaNeural")
+
+    last_error: Exception | None = None
+
+    for attempt in range(2):
+        try:
+            communicate = edge_tts.Communicate(text, voice)
+            buffer = io.BytesIO()
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    buffer.write(chunk["data"])
+            audio_bytes = buffer.getvalue()
+            if audio_bytes:
+                return base64.b64encode(audio_bytes).decode("utf-8")
+            print(
+                f"⚠️ edge-tts returned no audio (attempt {attempt + 1}/2, "
+                f"lang={language_code}, voice={voice})"
+            )
+        except Exception as e:
+            last_error = e
+            print(
+                f"⚠️ edge-tts synthesis failed (attempt {attempt + 1}/2, "
+                f"lang={language_code}, voice={voice}): {e!r}"
+            )
+
+            if _is_dns_failure(e):
+                print(
+                    "⚠️ That looks like a DNS/network failure reaching "
+                    "speech.platform.bing.com, not a transient blip -- "
+                    "skipping retry. Check this server's internet/DNS "
+                    "access (try `nslookup speech.platform.bing.com`)."
+                )
+                break
+
+        if attempt == 0:
+            await asyncio.sleep(0.5)
+
+    if last_error is not None:
+        print(
+            f"⚠️ edge-tts gave up (lang={language_code}, voice={voice}): "
+            f"{last_error!r}"
+        )
+
+    return ""
+
+
+# ============================================================
 # DATABASE
 # ============================================================
 
 MYSQL_HOST = os.environ.get("MYSQL_HOST", "localhost")
 MYSQL_PORT = int(os.environ.get("MYSQL_PORT", "3306"))
 MYSQL_USER = os.environ.get("MYSQL_USER", "root")
-MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "Tapu@7321")
+# BUGFIX: never hardcode a real password as the fallback default here --
+# it ends up committed to source control, baked into Docker images, and
+# visible to anyone with read access to this file. MYSQL_PASSWORD must
+# now be set via environment variable (e.g. a .env file that is NOT
+# checked into git); we fail fast at startup instead of silently
+# connecting with a stale/leaked credential.
+MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD")
 MYSQL_DATABASE = os.environ.get("MYSQL_DATABASE", "interviews_db")
+
+if not MYSQL_PASSWORD:
+    raise RuntimeError(
+        "MYSQL_PASSWORD environment variable is not set. "
+        "Set it (e.g. in a .env file that is gitignored) before starting the server."
+    )
 
 
 def ensure_database_exists():
@@ -144,8 +267,6 @@ def make_json_safe(value):
 # ANTI-CHEATING / PROCTORING
 # ============================================================
 
-# Point deduction applied per cheat event when computing the final
-# integrity_score. Keys match the counters tracked per session below.
 CHEAT_PENALTIES = {
     "tab_switches": 5,
     "copy_events": 10,
@@ -156,8 +277,6 @@ CHEAT_PENALTIES = {
 
 
 def calculate_integrity_score(cheat_counts: dict) -> int:
-    """100 minus weighted deductions for each proctoring event, clamped
-    to the [0, 100] range."""
     score = 100
     for key, penalty in CHEAT_PENALTIES.items():
         score -= cheat_counts.get(key, 0) * penalty
@@ -175,14 +294,6 @@ def save_interview_to_database(
     report: str,
     ended_early: bool = False,
 ):
-    """
-    Save final interview information into MySQL.
-
-    This function is intentionally kept outside the
-    WebSocket code so the interview logic doesn't need
-    to change.
-    """
-
     try:
         safe_state = make_json_safe(state or {})
         safe_scores = make_json_safe(scores or {})
@@ -210,7 +321,6 @@ def save_interview_to_database(
         print(f"✅ Interview saved to database: {session_id}")
 
     except Exception as e:
-        # Database failure should NOT crash the interview.
         print("❌ Failed to save interview to database:", repr(e))
         traceback.print_exc()
 
@@ -231,6 +341,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -246,35 +358,10 @@ graph = build_live_graph()
 
 
 GRAPH_INVOKE_TIMEOUT_SECONDS = 90
-
-# FIX: heartbeat interval shortened from 8s -> 4s. The frontend was
-# closing the socket (code 1011, "Connection lost. Please restart.")
-# during long-running answer turns (Whisper transcription + LLM
-# scoring, sometimes 30-40s+ when a Gemini call times out and falls
-# back to a second instance) because it wasn't reliably being kept
-# "alive" from its own point of view before its own timeout fired.
-# A tighter heartbeat cadence gives the frontend more/faster signals
-# to reset any client-side "still waiting" timer against. This is a
-# mitigation on the backend side -- the frontend ALSO needs to listen
-# for {"type": "processing"} messages and reset its own timeout on
-# every message received (not just on the final "score_update"), or
-# this change alone will not fully fix the disconnects.
 HEARTBEAT_INTERVAL_SECONDS = 4
 
 
 async def safe_send_json(websocket: WebSocket, payload: dict) -> bool:
-    """
-    Sends JSON to the client if (and only if) the socket is still
-    connected. Returns True/False instead of raising, so callers never
-    need their own try/except around every send.
-
-    FIX: the old version always attempted websocket.send_json() and only
-    caught the failure after the fact. Once Starlette has already torn
-    down a socket, a second send raises RuntimeError('Cannot call "send"
-    once a close message has been sent.') -- harmless on its own, but it
-    was also a symptom of the deeper bug below: the outer receive loop
-    kept calling receive_text() on a socket that was already gone.
-    """
     if websocket.client_state != WebSocketState.CONNECTED:
         return False
     try:
@@ -290,20 +377,6 @@ async def invoke_graph(state_or_command, config, websocket: WebSocket | None = N
 
     started = time.monotonic()
 
-    # FIX: a single "answer" turn can legitimately take 40-50+s (Whisper
-    # transcription alone took 44.6s in one observed session, and a
-    # single Gemini call can eat 10-11s before failing with a 504 and
-    # falling back to a second instance) with ZERO websocket traffic in
-    # either direction while it runs. That silence is exactly what made
-    # a real session drop mid-answer with WebSocket close code 1011
-    # ("Internal Error") / the frontend's own "Connection lost (code
-    # 1011). Please restart." message right as the backend finished --
-    # many browsers/proxies/load balancers (and naive frontend timeout
-    # logic) treat a long-idle websocket as dead and tear it down, even
-    # though nothing had actually failed. Sending a lightweight
-    # "processing" heartbeat every few seconds keeps the connection
-    # visibly alive (and lets the frontend show real progress) for the
-    # whole duration of a long invoke.
     heartbeat_task = None
     if websocket is not None:
 
@@ -355,9 +428,6 @@ async def invoke_graph(state_or_command, config, websocket: WebSocket | None = N
 # ============================================================
 
 video_frames: Dict[str, List[str]] = {}
-
-# Per-session anti-cheating counters. Keyed by session_id, values are
-# dicts shaped like _empty_cheat_counts().
 cheat_events: Dict[str, Dict[str, int]] = {}
 
 
@@ -368,20 +438,12 @@ cheat_events: Dict[str, Dict[str, int]] = {}
 @app.on_event("startup")
 async def warm_up_models():
 
-    # --------------------------------------------------------
-    # DATABASE INITIALIZATION
-    # --------------------------------------------------------
-
     try:
         ensure_database_exists()
         init_db()
         print("✅ Database initialization completed")
     except Exception as e:
         print("⚠️ Database initialization failed:", repr(e))
-
-    # --------------------------------------------------------
-    # MODEL WARM-UP
-    # --------------------------------------------------------
 
     def _warm():
         try:
@@ -422,25 +484,25 @@ async def warm_up_models():
 
 
 # ============================================================
-# SESSION LOCKS
-# ============================================================
-
-session_locks: Dict[str, asyncio.Lock] = {}
-
-
-def get_session_lock(session_id: str) -> asyncio.Lock:
-    if session_id not in session_locks:
-        session_locks[session_id] = asyncio.Lock()
-    return session_locks[session_id]
-
-
-# ============================================================
 # HEALTH
 # ============================================================
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "AI Mock Interview"}
+
+
+# ============================================================
+# FAVICON
+# ============================================================
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    # This API serves no favicon file. Returning 204 here (instead of
+    # letting the request fall through to FastAPI's default 404)
+    # stops routine browser favicon requests from showing up as
+    # errors in the server logs.
+    return Response(status_code=204)
 
 
 # ============================================================
@@ -502,11 +564,42 @@ async def upload_resume(file: UploadFile = File(...)):
         )
 
 
+@app.get("/interview/upload-resume")
+async def upload_resume_info():
+    """
+    GET is not a valid way to upload a resume -- this route only accepts
+    POST with a multipart PDF file (see `upload_resume` above). This
+    handler exists so a stray GET (someone navigating to the URL
+    directly, a health-check hitting the wrong method, etc.) gets a
+    clean, informative 200 response instead of a 405 cluttering the
+    server logs.
+    """
+    return {
+        "success": False,
+        "message": "This endpoint only accepts POST requests with a PDF file upload.",
+    }
+
+
 # ============================================================
 # EXTRACT LANGGRAPH EVENT
 # ============================================================
 
-def extract_event(result):
+async def extract_event(result):
+    """Builds the message sent to the frontend after each graph.invoke().
+
+    Generates the spoken-question audio (via edge-tts, in whatever
+    language the candidate picked at start) and attaches it as
+    `audio_b64`. The frontend plays this file directly instead of relying
+    on the browser's own speechSynthesis voice -- edge-tts gives us
+    genuine Azure Neural voices (far more natural than a browser voice,
+    and with real coverage of languages like Odia that many browsers
+    don't ship a decent voice for at all), and we can also mix this audio
+    into the full-session recording.
+
+    If edge-tts fails for any reason, audio_b64 comes back as "" and the
+    frontend already knows to fall back to speechSynthesis in that case --
+    so a TTS outage never blocks the interview.
+    """
 
     interrupts = result.get("__interrupt__")
 
@@ -515,10 +608,14 @@ def extract_event(result):
         value = interrupt_obj.value
 
         if isinstance(value, dict):
+            question_text = value.get("question", "No question generated.")
+            language_code = result.get("language_code", "en-US")
+
             return {
                 "type": "question",
-                "question": value.get("question", "No question generated."),
+                "question": question_text,
                 "question_number": value.get("question_number", 1),
+                "audio_b64": await synthesize_question_audio(question_text, language_code),
             }
 
     return {
@@ -541,22 +638,6 @@ def _safe_score(value, default=None):
 
 
 def extract_scores(result):
-    """
-    Aggregate per-turn scores from the transcript into a single
-    summary dict.
-
-    interview_graph_live.py's decision_engine computes real visual-
-    delivery and audio-delivery scores per turn via
-    src.video_analysis.ScoreEngine (eye contact, posture, expression,
-    fluency, grammar, pace, etc.) and stores them on each transcript
-    item as "visual_score" and "audio_delivery_score" (both 0-100).
-
-    This reads visual_score / audio_delivery_score directly, excludes
-    turns where they're 0 (meaning no frames/audio were analyzed for
-    that turn -- see vision_agent/decision_engine, e.g. a typed-only
-    answer), and folds both into the overall score.
-    """
-
     transcript = result.get("transcript") or []
 
     if not transcript:
@@ -600,11 +681,6 @@ def extract_scores(result):
         if confidence is not None:
             confidence_values.append(max(0.0, min(1.0, confidence)))
 
-        # visual_score / audio_delivery_score are 0 when decision_engine
-        # had no visual_metrics / audio_metrics to blend for that turn
-        # (e.g. no webcam frames, or Whisper had nothing to analyze).
-        # Exclude those turns rather than let them drag the delivery
-        # average toward 0 for reasons unrelated to actual delivery.
         if visual is not None and visual > 0:
             visual_values.append(max(0.0, min(100.0, visual)))
 
@@ -621,10 +697,6 @@ def extract_scores(result):
     visual = average(visual_values)
     audio_delivery = average(audio_delivery_values)
 
-    # Weighted overall, everything normalized to a 0-100 scale before
-    # weighting. Content (technical/relevance/communication) still
-    # dominates; confidence, visual delivery, and audio delivery each
-    # contribute a smaller slice. Weights sum to 1.0.
     overall = (
         (technical * 10) * 0.40
         + (relevance * 10) * 0.15
@@ -679,37 +751,13 @@ async def interview_websocket(websocket: WebSocket):
 
         while True:
 
-            # =================================================
-            # FIX: bail out of the receive loop the moment the
-            # socket is no longer connected, instead of calling
-            # receive_text() again and letting Starlette raise a
-            # bare RuntimeError that the except blocks below don't
-            # recognize as a normal disconnect.
-            #
-            # This is what your traceback was hitting:
-            #   RuntimeError: WebSocket is not connected. Need to
-            #   call "accept" first.
-            # It happened because a long graph.invoke() (42.5s in
-            # your log) let the client disappear mid-processing;
-            # every safe_send_json() after that correctly failed
-            # quietly, but the loop still looped back around to
-            # receive_text() on a socket Starlette had already
-            # closed out from under us.
-            # =================================================
             if websocket.client_state != WebSocketState.CONNECTED:
                 print(f"🔌 Socket no longer connected, exiting loop: {session_id}")
                 break
 
-            # =================================================
-            # RECEIVE
-            # =================================================
-
             try:
                 raw = await websocket.receive_text()
             except (WebSocketDisconnect, RuntimeError) as e:
-                # Normal disconnect, or the "not connected" RuntimeError
-                # Starlette raises on a second receive after a close --
-                # both mean the same thing here: the client is gone.
                 print(f"❌ WebSocket disconnected: {session_id} ({e!r})")
                 break
 
@@ -740,12 +788,9 @@ async def interview_websocket(websocket: WebSocket):
                 print("Resume length:", len(msg.get("resume_text", "")))
                 print("JD length:", len(msg.get("job_description", "")))
                 print("Max questions:", msg.get("max_questions"))
+                print("Language:", msg.get("language_code"), msg.get("language_name"))
 
             print("========================================")
-
-            # =================================================
-            # VIDEO FRAME
-            # =================================================
 
             if action == "video_frame":
                 frame = msg.get("frame_b64", "")
@@ -753,14 +798,18 @@ async def interview_websocket(websocket: WebSocket):
                 if frame:
                     video_frames[session_id].append(frame)
 
-                    if len(video_frames[session_id]) > 300:
-                        video_frames[session_id] = video_frames[session_id][-300:]
+                    # Only ~12 evenly-spaced frames are ever actually
+                    # analyzed per answer (see MAX_FRAMES_FORWARDED /
+                    # vision_agent's MAX_FRAMES_TO_ANALYZE) -- holding
+                    # hundreds of raw base64 JPEGs per session for the
+                    # full duration of a long answer just for that is
+                    # wasted memory. Lowered from 300 to 90 (still 5x more
+                    # than we'll ever sample down to).
+                    MAX_BUFFERED_FRAMES = 90
+                    if len(video_frames[session_id]) > MAX_BUFFERED_FRAMES:
+                        video_frames[session_id] = video_frames[session_id][-MAX_BUFFERED_FRAMES:]
 
                 continue
-
-            # =================================================
-            # ANTI-CHEATING EVENTS
-            # =================================================
 
             if action in (
                 "tab_switch",
@@ -828,6 +877,11 @@ async def interview_websocket(websocket: WebSocket):
                     "difficulty": "medium",
                     "questions_asked": 0,
                     "max_questions": int(max_questions),
+                    # Candidate-selected interview language. Defaults to
+                    # English so an older frontend build (or any client
+                    # that never sends these) still works unchanged.
+                    "language_code": msg.get("language_code", "en-US"),
+                    "language_name": msg.get("language_name", "English"),
                     "current_question": "",
                     "current_audio_b64": "",
                     "current_frames_b64": [],
@@ -839,7 +893,6 @@ async def interview_websocket(websocket: WebSocket):
                     "current_eval_feedback": "",
                     "transcript": [],
                     "final_report": "",
-                    # DATABASE FIELDS
                     "candidate_name": msg.get("candidate_name"),
                     "applied_role": msg.get("applied_role"),
                 }
@@ -848,7 +901,7 @@ async def interview_websocket(websocket: WebSocket):
 
                 try:
                     result = await invoke_graph(initial_state, config, websocket)
-                    event = extract_event(result)
+                    event = await extract_event(result)
 
                     print("📤 Sending:", event["type"])
 
@@ -895,6 +948,26 @@ async def interview_websocket(websocket: WebSocket):
 
                 print("🎥 Video frames:", len(frames_b64))
 
+                # BUGFIX: previously forwarded the ENTIRE buffered frame
+                # list (up to 300 raw base64 JPEGs) into graph state via
+                # Command(resume=...). For a multi-minute answer that's
+                # 100+ frames -- tens of MB -- and LangGraph's MemorySaver
+                # checkpoints the full state after every node transition
+                # for the rest of the turn (and keeps checkpoint history
+                # for the whole session). That memory/serialization spike
+                # is the most likely cause of the server crashing
+                # (WebSocket code 1011) specifically on longer answers.
+                # vision_agent only ever samples MAX_FRAMES_TO_ANALYZE (12)
+                # evenly-spaced frames anyway -- pre-sample down to that
+                # same count here, before any of this touches graph state.
+                MAX_FRAMES_FORWARDED = 12
+                if len(frames_b64) > MAX_FRAMES_FORWARDED:
+                    step = len(frames_b64) / MAX_FRAMES_FORWARDED
+                    frames_b64 = [
+                        frames_b64[int(i * step)] for i in range(MAX_FRAMES_FORWARDED)
+                    ]
+                    print(f"🎥 Downsampled to {len(frames_b64)} frames before sending to graph")
+
                 payload = {
                     "audio_b64": audio_b64,
                     "frames_b64": frames_b64,
@@ -902,21 +975,16 @@ async def interview_websocket(websocket: WebSocket):
                 }
 
                 video_frames[session_id] = []
-
                 try:
                     result = await invoke_graph(Command(resume=payload), config, websocket)
 
                     scores = extract_scores(result)
-
-                    # Merge in proctoring counts + integrity score.
                     counts = cheat_events.get(session_id, _empty_cheat_counts())
                     scores.update(counts)
                     scores["integrity_score"] = calculate_integrity_score(counts)
 
                     transcript = result.get("transcript", [])
 
-                    # Fold vision_agent's multi-face flag for this turn
-                    # into the session's proctoring counters.
                     if transcript:
                         last_turn = transcript[-1]
                         if isinstance(last_turn, dict) and last_turn.get(
@@ -934,12 +1002,9 @@ async def interview_websocket(websocket: WebSocket):
                                 f"(session {session_id}) -> "
                                 f"{counts['multiple_faces_events']}"
                             )
-
                     feedback = ""
-
                     if transcript:
                         feedback = transcript[-1].get("feedback", "")
-
                     sent = await safe_send_json(
                         websocket,
                         {
@@ -962,18 +1027,12 @@ async def interview_websocket(websocket: WebSocket):
                             "feedback": feedback,
                         },
                     )
-
                     if not sent:
-                        # Client is gone -- no point continuing to try to
-                        # send more messages or process further input on
-                        # this socket. Let the outer loop's connection
-                        # check end the session cleanly.
                         print(
                             f"🔌 Client disconnected mid-answer, "
                             f"ending session: {session_id}"
                         )
                         break
-
                     await safe_send_json(
                         websocket,
                         {
@@ -981,9 +1040,7 @@ async def interview_websocket(websocket: WebSocket):
                             "transcript": make_json_safe(transcript),
                         },
                     )
-
-                    event = extract_event(result)
-
+                    event = await extract_event(result)
                     if event["type"] == "question":
                         await safe_send_json(
                             websocket,
@@ -996,7 +1053,6 @@ async def interview_websocket(websocket: WebSocket):
                         safe_result = make_json_safe(result)
                         safe_scores = make_json_safe(scores)
 
-                        # SAVE NORMAL COMPLETION TO DATABASE
                         save_interview_to_database(
                             session_id=session_id,
                             state=safe_result,
@@ -1004,7 +1060,6 @@ async def interview_websocket(websocket: WebSocket):
                             report=report,
                             ended_early=False,
                         )
-
                         await safe_send_json(
                             websocket,
                             {
@@ -1013,7 +1068,6 @@ async def interview_websocket(websocket: WebSocket):
                                 "scores": safe_scores,
                             },
                         )
-
                         await safe_send_json(
                             websocket,
                             {
@@ -1026,7 +1080,6 @@ async def interview_websocket(websocket: WebSocket):
                         print("🏁 Interview completed")
 
                         break
-
                 except asyncio.TimeoutError:
                     print(
                         f"❌ ANSWER TIMEOUT after {GRAPH_INVOKE_TIMEOUT_SECONDS}s"
@@ -1056,35 +1109,25 @@ async def interview_websocket(websocket: WebSocket):
             # =================================================
 
             if action in ("end", "finish_interview"):
-
                 print("🛑 Interview ended by user")
-
                 try:
                     snapshot = await run_in_threadpool(graph.get_state, config)
-
                     state = (
                         snapshot.values if snapshot and snapshot.values else {}
                     )
-
                     state = make_json_safe(state)
-
                     transcript = state.get("transcript", [])
-
                     scores = extract_scores(state)
-
                     counts = cheat_events.get(session_id, _empty_cheat_counts())
                     scores.update(counts)
                     scores["integrity_score"] = calculate_integrity_score(counts)
-
                     print("========== FINAL EARLY SCORE ==========")
                     print("Questions answered:", len(transcript))
                     print("Scores:", scores)
                     print("Transcript:", transcript)
                     print("======================================")
-
                     questions_answered = len(transcript)
                     max_q = state.get("max_questions", MAX_QUESTIONS)
-
                     if questions_answered == 0:
                         report = (
                             "The interview was ended before any questions "
@@ -1099,7 +1142,6 @@ async def interview_websocket(websocket: WebSocket):
                             f"{questions_answered} completed answer(s)."
                         )
 
-                    # SAVE EARLY INTERVIEW TO DATABASE
                     save_interview_to_database(
                         session_id=session_id,
                         state=state,
@@ -1107,7 +1149,6 @@ async def interview_websocket(websocket: WebSocket):
                         report=report,
                         ended_early=True,
                     )
-
                     await safe_send_json(
                         websocket,
                         {"type": "final_report", "report": report, "scores": scores},
@@ -1143,10 +1184,6 @@ async def interview_websocket(websocket: WebSocket):
 
                 break
 
-            # =================================================
-            # UNKNOWN
-            # =================================================
-
             print("⚠️ Unknown action:", action)
 
             await safe_send_json(
@@ -1157,12 +1194,6 @@ async def interview_websocket(websocket: WebSocket):
         print(f"❌ WebSocket disconnected: {session_id}")
 
     except RuntimeError as e:
-        # FIX: this is the same class of error your traceback showed --
-        # a receive/send attempted after Starlette already tore the
-        # socket down. Treat it the same as a normal disconnect instead
-        # of letting it fall through to the generic handler below and
-        # print a scary (but harmless) traceback every time a client
-        # closes the tab mid-request.
         print(f"🔌 WebSocket already closed for session {session_id}: {e!r}")
 
     except Exception as e:
@@ -1177,5 +1208,4 @@ async def interview_websocket(websocket: WebSocket):
     finally:
         video_frames.pop(session_id, None)
         cheat_events.pop(session_id, None)
-        session_locks.pop(session_id, None)
         print(f"🧹 Session cleaned: {session_id}")
