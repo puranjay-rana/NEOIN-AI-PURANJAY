@@ -9,6 +9,7 @@ export const AIAvatarSection = ({
   question,
   isProcessing,
   repeatQuestion,
+  handleCompleteInterview,
   setShowExitModal,
   showTextAnswer,
   setShowTextAnswer,
@@ -64,8 +65,14 @@ export const AIAvatarSection = ({
           </div>
         </div>
 
-        {/* Question Text */}
-        <div className="question-body-text">
+        {/* Question Text (Strict Copy Disabled) */}
+        <div 
+          className="question-body-text"
+          style={{ userSelect: "none", WebkitUserSelect: "none", MozUserSelect: "none", msUserSelect: "none" }}
+          onCopy={(e) => e.preventDefault()}
+          onCut={(e) => e.preventDefault()}
+          onContextMenu={(e) => e.preventDefault()}
+        >
           {isProcessing ? (
             <span style={{ color: "#4f46e5", display: "flex", alignItems: "center", gap: "0.5rem" }}>
               <span style={{ width: "8px", height: "8px", borderRadius: "50%", backgroundColor: "#4f46e5" }} />
@@ -76,17 +83,24 @@ export const AIAvatarSection = ({
           )}
         </div>
 
-        {/* Inline Text Answer Input Box (Right next to Question) */}
+        {/* Inline Text Answer Input Box (Paste Disabled) */}
         {showTextAnswer && (
           <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem", padding: "0.85rem", background: "#ffffff", border: "1px solid #cbd5e1", borderRadius: "14px", marginTop: "0.5rem" }}>
             <label style={{ fontSize: "0.7rem", fontWeight: "700", textTransform: "uppercase", letterSpacing: "0.05em", color: "#475569" }}>
-              Type Text Answer Response
+              Type Text Answer Response (Pasting Disabled for Security)
             </label>
             <textarea 
               rows={3} 
               placeholder="Type your response here..." 
               value={answer} 
               onChange={(e) => setAnswer(e.target.value)} 
+              onPaste={(e) => {
+                e.preventDefault();
+                alert("⚠️ Pasting text is disabled during proctored assessments. Please type your response directly.");
+              }}
+              onCopy={(e) => e.preventDefault()}
+              onCut={(e) => e.preventDefault()}
+              onContextMenu={(e) => e.preventDefault()}
               className="setup-input-control"
               style={{ minHeight: "85px", resize: "vertical", fontSize: "0.875rem" }}
             />
@@ -129,9 +143,9 @@ export const AIAvatarSection = ({
             )}
           </div>
 
-          {setShowExitModal && (
+          {handleCompleteInterview && (
             <button 
-              onClick={() => setShowExitModal(true)} 
+              onClick={handleCompleteInterview} 
               className="finish-early-btn"
             >
               <LogOut size={13} />

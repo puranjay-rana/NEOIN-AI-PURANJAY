@@ -20,6 +20,7 @@ import { uploadResumeApi } from "./services/api";
 // UI Components
 import { Alert } from "./components/common/UIComponents";
 import { AssessmentSetup } from "./components/setup/AssessmentSetup";
+import { HistoryPage } from "./components/setup/HistoryPage";
 
 // Live Interview View Components
 import { InterviewHeader } from "./components/interview/InterviewHeader";
@@ -51,8 +52,8 @@ function App() {
   const answerFramesRef = useRef([]);
   const frameTimerRef = useRef(null);
   const transcriptEndRef = useRef(null);
-  const lastSpokenQuestionRef = useRef(""); 
-  const askedQuestionsRef = useRef([]); 
+  const lastSpokenQuestionRef = useRef("");
+  const askedQuestionsRef = useRef([]);
   const lastAcceptedQuestionNumberRef = useRef(0);
   const answerSubmitLockRef = useRef(false);
   const interviewPhaseRef = useRef("IDLE");
@@ -67,8 +68,8 @@ function App() {
   const startingInterviewRef = useRef(false);
   const startingRecordingRef = useRef(false);
   const finishRequestedRef = useRef(false);
-  const manualExitRef = useRef(false); 
-  const finishFallbackTimerRef = useRef(null); 
+  const manualExitRef = useRef(false);
+  const finishFallbackTimerRef = useRef(null);
   const cheatWarningTimerRef = useRef(null);
   const showTextAnswerRef = useRef(false);
 
@@ -92,7 +93,8 @@ function App() {
   const [resumeText, setResumeText] = useState("");
   const [jobDescription, setJobDescription] = useState("");
   const [maxQuestions, setMaxQuestions] = useState(DEFAULT_MAX_QUESTIONS);
-  const [interviewLanguage, setInterviewLanguage] = useState("en-US");
+  const [interviewLanguage, setInterviewLanguage] = useState("en-IN");
+  const [showHistoryPage, setShowHistoryPage] = useState(false);
 
   // Candidate Metadata State
   const [candidateName, setCandidateName] = useState("");
@@ -123,7 +125,7 @@ function App() {
   const [camEnabled, setCamEnabled] = useState(true);
   const [expandedIndex, setExpandedIndex] = useState(0);
 
-  // Scores State
+  // Scores State (100% Backend-Driven)
   const [scores, setScores] = useState({
     technical: 0,
     relevance: 0,
@@ -136,12 +138,18 @@ function App() {
     leadership: 0,
     domainKnowledge: 0,
     integrity: 100,
+    eye_contact: 0,
+    posture: 0,
+    expression: 0,
+    clarity: 0,
+    filler_words: 0,
+    pace: "N/A",
   });
 
   const [transcript, setTranscript] = useState([]);
   const [backendTranscript, setBackendTranscript] = useState([]);
   const [feedback, setFeedback] = useState("");
-  const [hasScore, setHasScore] = useState(false); 
+  const [hasScore, setHasScore] = useState(false);
   const [finalReport, setFinalReport] = useState("");
   const [status, setStatus] = useState("Ready");
   const [error, setError] = useState("");
@@ -155,6 +163,42 @@ function App() {
     fullscreenExits: 0,
     multipleFaces: 0,
   });
+
+  // Assessment Session History State (Stored & Synced in MySQL Database)
+  const [historyList, setHistoryList] = useState([]);
+
+  const fetchHistory = async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/interviews`);
+      const data = await res.json();
+      if (data.success && Array.isArray(data.interviews)) {
+        const mapped = data.interviews.map((item) => {
+          const createdAt = item.created_at ? new Date(item.created_at) : new Date();
+          return {
+            id: item.id,
+            candidateName: item.candidate_name || "Candidate",
+            appliedRole: item.applied_role || "Target Role",
+            interviewDate: !isNaN(createdAt.getTime())
+              ? createdAt.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })
+              : "Completed",
+            scores: item.scores || {},
+            backendTranscript: item.transcript || [],
+            finalReport: item.final_report || "",
+            videoScore: item.video_score ?? item.scores?.video ?? 0,
+            confidenceScore: item.confidence_score ?? item.scores?.confidence ?? 0,
+            overallScore: item.overall_score ?? item.scores?.overall ?? 0,
+          };
+        });
+        setHistoryList(mapped);
+      }
+    } catch (e) {
+      console.warn("Could not fetch interview history from MySQL:", e);
+    }
+  };
+
+  useEffect(() => {
+    fetchHistory();
+  }, []);
 
   useEffect(() => {
     showTextAnswerRef.current = showTextAnswer;
@@ -173,9 +217,9 @@ function App() {
     };
   }, []);
 
-  // Analytics Calculations
-  const videoAnalytics = useMemo(() => computeVideoAnalytics(backendTranscript), [backendTranscript]);
-  const voiceAnalytics = useMemo(() => computeVoiceAnalytics(backendTranscript), [backendTranscript]);
+  // Analytics Calculations (Derived purely from backend metrics & transcript)
+  const videoAnalytics = useMemo(() => computeVideoAnalytics(backendTranscript, scores), [backendTranscript, scores]);
+  const voiceAnalytics = useMemo(() => computeVoiceAnalytics(backendTranscript, scores), [backendTranscript, scores]);
   const confidenceTimeline = useMemo(() => computeConfidenceTimeline(backendTranscript), [backendTranscript]);
 
   // General Cleanup on Unmount
@@ -201,7 +245,7 @@ function App() {
       maxAnswerTimeoutRef.current = null;
     }
     if (silenceAudioCtxRef.current) {
-      try { silenceAudioCtxRef.current.close(); } catch (_) {}
+      try { silenceAudioCtxRef.current.close(); } catch (_) { }
       silenceAudioCtxRef.current = null;
     }
     silenceStartedAtRef.current = null;
@@ -213,13 +257,13 @@ function App() {
     stopVideoFrameCapture();
     stopSilenceDetection();
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      try { mediaRecorderRef.current.stop(); } catch (_) {}
+      try { mediaRecorderRef.current.stop(); } catch (_) { }
     }
     if (sessionRecorderRef.current && sessionRecorderRef.current.state !== "inactive") {
-      try { sessionRecorderRef.current.stop(); } catch (_) {}
+      try { sessionRecorderRef.current.stop(); } catch (_) { }
     }
     if (sessionAudioCtxRef.current) {
-      try { sessionAudioCtxRef.current.close(); } catch (_) {}
+      try { sessionAudioCtxRef.current.close(); } catch (_) { }
       sessionAudioCtxRef.current = null;
       sessionMixDestRef.current = null;
     }
@@ -315,7 +359,7 @@ function App() {
 
       try {
         audioEl.currentTime = 0;
-      } catch (_) {}
+      } catch (_) { }
       audioEl.play().catch(() => {
         audioEl.onplay = originalOnPlay;
         audioEl.onended = originalOnEnded;
@@ -372,20 +416,31 @@ function App() {
     const handleVisibilityChange = () => {
       if (document.hidden) sendCheatEvent("tab_switch");
     };
-    const handleCopy = () => sendCheatEvent("copy_detected");
-    const handlePaste = () => sendCheatEvent("paste_detected");
+    const handleCopy = (e) => {
+      e.preventDefault();
+      sendCheatEvent("copy_detected");
+    };
+    const handleCut = (e) => {
+      e.preventDefault();
+    };
+    const handlePaste = (e) => {
+      e.preventDefault();
+      sendCheatEvent("paste_detected");
+    };
     const handleFullscreenChange = () => {
       if (!document.fullscreenElement) sendCheatEvent("fullscreen_exit");
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
     document.addEventListener("copy", handleCopy);
+    document.addEventListener("cut", handleCut);
     document.addEventListener("paste", handlePaste);
     document.addEventListener("fullscreenchange", handleFullscreenChange);
 
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       document.removeEventListener("copy", handleCopy);
+      document.removeEventListener("cut", handleCut);
       document.removeEventListener("paste", handlePaste);
       document.removeEventListener("fullscreenchange", handleFullscreenChange);
     };
@@ -465,7 +520,7 @@ function App() {
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         videoRef.current.muted = true;
-        try { await videoRef.current.play(); } catch (_) {}
+        try { await videoRef.current.play(); } catch (_) { }
       }
 
       return stream;
@@ -487,7 +542,7 @@ function App() {
   const connectWebSocket = () => {
     return new Promise((resolve, reject) => {
       if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
-        try { wsRef.current.close(); } catch (_) {}
+        try { wsRef.current.close(); } catch (_) { }
       }
 
       const ws = new WebSocket(WS_URL);
@@ -507,7 +562,14 @@ function App() {
 
       ws.onclose = (event) => {
         setConnected(false);
-        if (!interviewFinished) {
+        if (started && !interviewFinished && !finishRequestedRef.current) {
+          setStatus("Reconnecting to AI Interviewer...");
+          setTimeout(() => {
+            if (started && !interviewFinished && !finishRequestedRef.current) {
+              connectWebSocket().catch((err) => console.log("Reconnection attempt failed:", err));
+            }
+          }, 2000);
+        } else if (!interviewFinished) {
           setStatus("Disconnected");
         }
       };
@@ -584,7 +646,23 @@ function App() {
         if (data.feedback) setFeedback(data.feedback);
         break;
       case "transcript_update":
-        if (Array.isArray(data.transcript)) setBackendTranscript(data.transcript);
+        if (Array.isArray(data.transcript)) {
+          setBackendTranscript(data.transcript);
+          const lastItem = [...data.transcript].reverse().find(t => t.answer || t.candidate_answer || t.text);
+          if (lastItem) {
+            const actualText = lastItem.answer || lastItem.candidate_answer || lastItem.text;
+            setTranscript((prev) => {
+              const updated = [...prev];
+              for (let i = updated.length - 1; i >= 0; i--) {
+                if (updated[i].sender === "Candidate") {
+                  updated[i] = { ...updated[i], text: actualText };
+                  break;
+                }
+              }
+              return updated;
+            });
+          }
+        }
         break;
       case "answer_result":
         if (data.feedback) setFeedback(data.feedback);
@@ -596,7 +674,23 @@ function App() {
           updateCheatStats(data);
         }
         setHasScore(true);
-        if (Array.isArray(data.transcript)) setBackendTranscript(data.transcript);
+        if (Array.isArray(data.transcript)) {
+          setBackendTranscript(data.transcript);
+          const lastItem = [...data.transcript].reverse().find(t => t.answer || t.candidate_answer || t.text);
+          if (lastItem) {
+            const actualText = lastItem.answer || lastItem.candidate_answer || lastItem.text;
+            setTranscript((prev) => {
+              const updated = [...prev];
+              for (let i = updated.length - 1; i >= 0; i--) {
+                if (updated[i].sender === "Candidate") {
+                  updated[i] = { ...updated[i], text: actualText };
+                  break;
+                }
+              }
+              return updated;
+            });
+          }
+        }
         setRecording(false);
         setIsProcessing(true);
         interviewPhaseRef.current = "PROCESSING_ANSWER";
@@ -607,17 +701,19 @@ function App() {
         }
         break;
       case "final_report":
-      case "interview_complete":
-        setFinalReport(data.report || data.final_report || "");
-        if (data.scores) {
-          updateScores(data.scores);
-          updateCheatStats(data.scores);
-        } else {
-          updateScores(data);
-          updateCheatStats(data);
+      case "interview_complete": {
+        const reportText = data.report || data.final_report || "";
+        setFinalReport(reportText);
+        const freshScores = updateScores(data.scores || data);
+        updateCheatStats(data.scores || data);
+        let freshTranscript = null;
+        if (Array.isArray(data.transcript) && data.transcript.length > 0) {
+          setBackendTranscript(data.transcript);
+          freshTranscript = data.transcript;
         }
-        finishInterviewLocally();
+        finishInterviewLocally(freshScores, freshTranscript, reportText);
         break;
+      }
       case "cheat_event_ack":
         if (data.counts) updateCheatStats(data.counts);
         break;
@@ -635,23 +731,57 @@ function App() {
     }
   };
 
-  const finishInterviewLocally = () => {
+  const stopAllAudio = () => {
+    if ("speechSynthesis" in window) {
+      try { window.speechSynthesis.cancel(); } catch (_) { }
+    }
+    if (ttsAudioElRef.current) {
+      try {
+        ttsAudioElRef.current.pause();
+        ttsAudioElRef.current.currentTime = 0;
+        ttsAudioElRef.current.src = "";
+        ttsAudioElRef.current.onplay = null;
+        ttsAudioElRef.current.onended = null;
+        ttsAudioElRef.current.onerror = null;
+      } catch (_) { }
+    }
+    setIsSpeakingAI(false);
+  };
+
+  const historySavedRef = useRef(false);
+
+  const finishInterviewLocally = (explicitScores, explicitTranscript, explicitReport) => {
     if (finishFallbackTimerRef.current) {
       clearTimeout(finishFallbackTimerRef.current);
       finishFallbackTimerRef.current = null;
     }
-    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
-    setIsSpeakingAI(false);
+    stopAllAudio();
     stopVideoFrameCapture();
     stopSilenceDetection();
+    stopSpeechRecognition();
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-      try { mediaRecorderRef.current.stop(); } catch (_) {}
+      try { mediaRecorderRef.current.stop(); } catch (_) { }
     }
     stopFullSessionRecording();
     if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach((track) => track.stop());
     setRecording(false);
+    setIsProcessing(false);
     setEndedEarly(manualExitRef.current);
     setInterviewFinished(true);
+
+    const finalScores = explicitScores || scores;
+    const finalTranscript = explicitTranscript || backendTranscript;
+    const finalRep = explicitReport || finalReport;
+
+    // Sync completed interview history directly from MySQL database
+    if (!historySavedRef.current) {
+      historySavedRef.current = true;
+      // Fetch latest records saved by backend to MySQL
+      setTimeout(() => {
+        fetchHistory();
+      }, 1200);
+    }
+
     if (document.fullscreenElement) {
       const exit =
         document.exitFullscreen ||
@@ -659,22 +789,104 @@ function App() {
         document.mozCancelFullScreen ||
         document.msExitFullscreen;
       if (exit) {
-        try { exit.call(document); } catch (_) {}
+        try { exit.call(document); } catch (_) { }
       }
     }
   };
 
-  const updateScores = (data = {}) => {
-    setScores((previous) => ({
+  const clearHistory = async () => {
+    try {
+      await fetch(`${API_URL}/api/interviews`, { method: "DELETE" });
+    } catch (e) {
+      console.error("Failed to clear MySQL interviews:", e);
+    }
+    setHistoryList([]);
+  };
+
+  const deleteHistorySession = async (sessionId) => {
+    try {
+      await fetch(`${API_URL}/api/interviews/${sessionId}`, { method: "DELETE" });
+      setHistoryList((prev) => prev.filter((item) => item.id !== sessionId));
+    } catch (e) {
+      console.error("Failed to delete MySQL interview session:", e);
+    }
+  };
+
+  const finishInterview = () => {
+    if (finishRequestedRef.current) return;
+    finishRequestedRef.current = true;
+
+    stopAllAudio();
+    stopVideoFrameCapture();
+    setIsProcessing(true);
+    setStatus("Generating comprehensive evaluation report...");
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "finish_interview" }));
+    } else {
+      finishInterviewLocally();
+      return;
+    }
+
+    // Extended fallback to allow full AI scoring (Whisper + OpenCV + LLM) to complete
+    finishFallbackTimerRef.current = setTimeout(() => {
+      if (!interviewFinished) finishInterviewLocally();
+    }, 25000);
+  };
+
+  const handleCompleteInterview = async () => {
+    manualExitRef.current = true;
+    setShowExitModal(false);
+    setStatus("Finalizing response and completing assessment...");
+    setIsProcessing(true);
+    stopAllAudio();
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+      try {
+        await stopRecording();
+      } catch (_) { }
+      // Give the recorder onstop a moment to transmit the answer payload
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    finishInterview();
+  };
+
+  const parseScores = (data = {}, previous = {}) => {
+    let tech = data.technical ?? data.technical_score ?? (data.eval_score !== undefined ? data.eval_score * 10 : undefined);
+    let rel = data.relevance ?? data.relevance_score ?? (data.raw_relevance !== undefined ? data.raw_relevance * 10 : undefined);
+    let comm = data.communication ?? data.communication_score ?? (data.raw_communication !== undefined ? data.raw_communication * 10 : undefined);
+    let conf = data.confidence ?? data.confidence_score;
+    let vid = data.video ?? data.video_score ?? data.visual_score;
+    let aud = data.audio_delivery ?? data.audio_delivery_score;
+    let overall = data.overall ?? data.overall_score;
+
+    if (conf !== undefined && conf !== null && conf > 0 && conf <= 1.0) conf = conf * 100;
+
+    return {
       ...previous,
-      technical: safeRound(data.technical ?? data.technical_score, previous.technical),
-      relevance: safeRound(data.relevance ?? data.relevance_score, previous.relevance),
-      communication: safeRound(data.communication ?? data.communication_score, previous.communication),
-      video: safeRound(data.video ?? data.video_score, previous.video),
-      confidence: safeRound(data.confidence ?? data.confidence_score, previous.confidence),
-      overall: safeRound(data.overall ?? data.overall_score, previous.overall),
-      integrity: safeRound(data.integrity_score ?? data.integrity, previous.integrity),
-    }));
+      technical: safeRound(tech, previous.technical ?? 0),
+      relevance: safeRound(rel, previous.relevance ?? 0),
+      communication: safeRound(comm, previous.communication ?? 0),
+      video: safeRound(vid, previous.video ?? 0),
+      audio_delivery: safeRound(aud, previous.audio_delivery ?? 0),
+      confidence: safeRound(conf, previous.confidence ?? 0),
+      overall: safeRound(overall, previous.overall ?? 0),
+      integrity: safeRound(data.integrity_score ?? data.integrity, previous.integrity ?? 100),
+      eye_contact: safeRound(data.eye_contact, previous.eye_contact ?? 0),
+      posture: safeRound(data.posture, previous.posture ?? 0),
+      expression: safeRound(data.expression, previous.expression ?? 0),
+      clarity: safeRound(data.clarity, previous.clarity ?? 0),
+      filler_words: data.filler_words ?? previous.filler_words ?? 0,
+      pace: data.pace ?? previous.pace ?? "N/A",
+    };
+  };
+
+  const updateScores = (data = {}) => {
+    let computed = null;
+    setScores((previous) => {
+      computed = parseScores(data, previous);
+      return computed;
+    });
+    return computed || parseScores(data, scores);
   };
 
   const updateCheatStats = (data = {}) => {
@@ -708,7 +920,7 @@ function App() {
     if (!stream) return;
 
     if (sessionAudioCtxRef.current) {
-      try { sessionAudioCtxRef.current.close(); } catch (_) {}
+      try { sessionAudioCtxRef.current.close(); } catch (_) { }
       sessionAudioCtxRef.current = null;
       sessionMixDestRef.current = null;
     }
@@ -718,7 +930,7 @@ function App() {
       if (!AudioCtx) return;
       const audioCtx = new AudioCtx();
       if (audioCtx.state === "suspended") {
-        audioCtx.resume().catch(() => {});
+        audioCtx.resume().catch(() => { });
       }
       const dest = audioCtx.createMediaStreamDestination();
 
@@ -800,6 +1012,7 @@ function App() {
 
   const startInterview = async () => {
     if (startingInterviewRef.current || started || isStarting) return;
+    historySavedRef.current = false;
     startingInterviewRef.current = true;
     setIsStarting(true);
 
@@ -860,6 +1073,8 @@ function App() {
 
         ws.send(JSON.stringify({
           type: "start_interview",
+          candidate_name: candidateName?.trim() || "Candidate",
+          applied_role: appliedRole?.trim() || "Target Role",
           resume_text: extractedResume,
           job_description: jobDescription,
           max_questions: maxQuestions,
@@ -932,7 +1147,7 @@ function App() {
       const recognition = new SpeechRecognitionImpl();
       recognition.continuous = true;
       recognition.interimResults = true;
-      recognition.lang = interviewLanguage;
+      recognition.lang = interviewLanguage || "en-IN";
       recognition.onresult = (event) => {
         let interim = "";
         for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -944,7 +1159,7 @@ function App() {
       };
       recognition.onend = () => {
         if (recognitionRef.current === recognition) {
-          try { recognition.start(); } catch (_) {}
+          try { recognition.start(); } catch (_) { }
         }
       };
       recognitionRef.current = recognition;
@@ -961,7 +1176,7 @@ function App() {
       try {
         recognition.onend = null;
         recognition.stop();
-      } catch (_) {}
+      } catch (_) { }
     }
   };
 
@@ -1024,7 +1239,11 @@ function App() {
     }
 
     const sourceAudioTrack = sourceStream.getAudioTracks()[0];
-    let audioStream = new MediaStream([sourceAudioTrack.clone()]);
+    if (!sourceAudioTrack) {
+      startingRecordingRef.current = false;
+      return;
+    }
+    let audioStream = new MediaStream([sourceAudioTrack]);
     audioRecordingStreamRef.current = audioStream;
 
     chunksRef.current = [];
@@ -1042,7 +1261,7 @@ function App() {
         const blob = new Blob(chunksRef.current, { type: mimeType });
         const base64 = await blobToBase64(blob);
         const frames = [...answerFramesRef.current];
-        const spokenText = finalTranscriptRef.current.trim();
+        const spokenText = (answer || finalTranscriptRef.current || "").trim();
 
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(JSON.stringify({
@@ -1055,7 +1274,7 @@ function App() {
           }));
         }
 
-        setTranscript((prev) => [...prev, { sender: "Candidate", text: spokenText || "[Voice Answer]" }]);
+        setTranscript((prev) => [...prev, { sender: "Candidate", text: spokenText || "Voice response submitted" }]);
         setAnswer("");
         finalTranscriptRef.current = "";
         setRecording(false);
@@ -1066,10 +1285,7 @@ function App() {
       } finally {
         stopSpeechRecognition();
         stopSilenceDetection();
-        if (audioRecordingStreamRef.current) {
-          audioRecordingStreamRef.current.getTracks().forEach((t) => t.stop());
-          audioRecordingStreamRef.current = null;
-        }
+        audioRecordingStreamRef.current = null;
         mediaRecorderRef.current = null;
       }
     };
@@ -1126,58 +1342,56 @@ function App() {
     setAnswer("");
   };
 
-  const finishInterview = () => {
-    if (finishRequestedRef.current) return;
-    finishRequestedRef.current = true;
-
-    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
-    setIsSpeakingAI(false);
-    stopVideoFrameCapture();
-
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "finish_interview" }));
-    } else {
-      finishInterviewLocally();
-      return;
+  const loadHistorySession = async (session) => {
+    if (!session) return;
+    let fullSession = session;
+    if (!session.backendTranscript || session.backendTranscript.length === 0) {
+      try {
+        const res = await fetch(`${API_URL}/api/interviews/${session.id}`);
+        const data = await res.json();
+        if (data.success && data.interview) {
+          fullSession = {
+            ...session,
+            scores: data.interview.scores || session.scores,
+            backendTranscript: data.interview.transcript || [],
+            finalReport: data.interview.final_report || session.finalReport,
+          };
+        }
+      } catch (e) {
+        console.warn("Could not fetch full session from MySQL:", e);
+      }
     }
-
-    finishFallbackTimerRef.current = setTimeout(() => {
-      if (!interviewFinished) finishInterviewLocally();
-    }, 10000);
-  };
-
-  const handleCompleteInterview = async () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-      await stopRecording();
-    }
-    finishInterview();
-    setShowExitModal(false);
-  };
-
-  const previewDashboard = () => {
+    setCandidateName(fullSession.candidateName || "Candidate");
+    setAppliedRole(fullSession.appliedRole || "Software Engineer");
+    if (fullSession.scores) setScores(fullSession.scores);
+    if (Array.isArray(fullSession.backendTranscript)) setBackendTranscript(fullSession.backendTranscript);
+    if (fullSession.finalReport) setFinalReport(fullSession.finalReport);
+    setShowHistoryPage(false);
     setStarted(true);
     setInterviewFinished(true);
-    setAppliedRole(appliedRole || "Senior Frontend Engineer");
-    setScores({
-      technical: 88,
-      relevance: 92,
-      communication: 85,
-      video: 80,
-      confidence: 86,
-      overall: 87,
-      resumeMatch: 90,
-      problemSolving: 85,
-      leadership: 82,
-      domainKnowledge: 89,
-      integrity: 100,
-    });
   };
 
   const resetToSetup = () => {
     setStarted(false);
     setInterviewFinished(false);
     setIsStarting(false);
+    setShowHistoryPage(false);
   };
+
+  // ----------------------------------------------------
+  // VIEW: Standalone Full Assessment Session History Page
+  // ----------------------------------------------------
+  if (showHistoryPage && !started) {
+    return (
+      <HistoryPage
+        historyList={historyList}
+        loadHistorySession={loadHistorySession}
+        onBackToSetup={() => setShowHistoryPage(false)}
+        onClearHistory={clearHistory}
+        onDeleteSession={deleteHistorySession}
+      />
+    );
+  }
 
   // ----------------------------------------------------
   // VIEW 1: Candidate Assessment Setup
@@ -1197,7 +1411,9 @@ function App() {
         startInterview={startInterview}
         isStarting={isStarting}
         error={error}
-        previewDashboard={previewDashboard}
+        historyList={historyList}
+        loadHistorySession={loadHistorySession}
+        onOpenHistory={() => setShowHistoryPage(true)}
       />
     );
   }
@@ -1209,11 +1425,11 @@ function App() {
     return (
       <div className="stage-page-shell">
         <main className="stage-main-content" style={{ display: "flex", flexDirection: "column", gap: "1.5rem" }}>
-          <DashboardHeader 
-            candidateName={candidateName || "Candidate"} 
-            appliedRole={appliedRole || "Senior Developer"} 
-            interviewDate={interviewDate} 
-            elapsedSeconds={elapsedSeconds} 
+          <DashboardHeader
+            candidateName={candidateName || "Candidate"}
+            appliedRole={appliedRole || "Senior Developer"}
+            interviewDate={interviewDate}
+            elapsedSeconds={elapsedSeconds}
             resetToSetup={resetToSetup}
             finalReport={finalReport}
           />
@@ -1223,19 +1439,21 @@ function App() {
             <SkillMetricsSection scores={scores} />
           </div>
 
-          <AnalyticsSection 
-            videoAnalytics={videoAnalytics} 
-            voiceAnalytics={voiceAnalytics} 
-            confidenceTimeline={confidenceTimeline} 
+          {/* 3-Card Single Row: Video Analytics | Voice Analytics | Proctoring Summary */}
+          <AnalyticsSection
+            videoAnalytics={videoAnalytics}
+            voiceAnalytics={voiceAnalytics}
+            confidenceTimeline={confidenceTimeline}
+            cheatStats={cheatStats}
           />
 
-          <QuestionBreakdown 
-            backendTranscript={backendTranscript} 
-            expandedIndex={expandedIndex} 
-            setExpandedIndex={setExpandedIndex} 
+          {/* Question Breakdown & Evaluation (At the VERY LAST Position) */}
+          <QuestionBreakdown
+            backendTranscript={backendTranscript}
+            scores={scores}
+            expandedIndex={expandedIndex}
+            setExpandedIndex={setExpandedIndex}
           />
-
-          <ProctoringSummary cheatStats={cheatStats} />
         </main>
       </div>
     );
@@ -1246,10 +1464,10 @@ function App() {
   // ----------------------------------------------------
   return (
     <div className="stage-page-shell">
-      <InterviewHeader 
-        elapsedSeconds={elapsedSeconds} 
-        candidateName={candidateName} 
-        appliedRole={appliedRole} 
+      <InterviewHeader
+        elapsedSeconds={elapsedSeconds}
+        candidateName={candidateName}
+        appliedRole={appliedRole}
       />
 
       <main className="stage-main-content">
@@ -1267,7 +1485,7 @@ function App() {
         <div className="interview-grid-layout">
           {/* Left Panel: Video Camera Stage */}
           <div>
-            <CandidateFeedSection 
+            <CandidateFeedSection
               videoRef={videoRef}
               recording={recording}
               toggleMic={toggleMic}
@@ -1282,7 +1500,7 @@ function App() {
 
           {/* Right Panel: AI Interview Assistant Persona & Question Card */}
           <div className="assistant-panel-card" style={{ minHeight: "auto" }}>
-            <AIAvatarSection 
+            <AIAvatarSection
               isSpeakingAI={isSpeakingAI}
               status={status}
               questionNumber={questionNumber}
@@ -1290,6 +1508,7 @@ function App() {
               question={question}
               isProcessing={isProcessing}
               repeatQuestion={repeatQuestion}
+              handleCompleteInterview={handleCompleteInterview}
               setShowExitModal={setShowExitModal}
               showTextAnswer={showTextAnswer}
               setShowTextAnswer={setShowTextAnswer}
@@ -1301,15 +1520,9 @@ function App() {
         </div>
 
         {/* Full-Width Bottom Panel: Pure Live Session Transcript History Stream */}
-        <TranscriptSection 
+        <TranscriptSection
           transcript={transcript}
           transcriptEndRef={transcriptEndRef}
-        />
-
-        <ExitModal 
-          showExitModal={showExitModal}
-          setShowExitModal={setShowExitModal}
-          handleCompleteInterview={handleCompleteInterview}
         />
       </main>
     </div>

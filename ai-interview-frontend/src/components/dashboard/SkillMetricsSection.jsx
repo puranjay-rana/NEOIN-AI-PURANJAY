@@ -2,14 +2,15 @@ import React from "react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, Cell, LabelList } from "recharts";
 import { Award, TrendingUp } from "lucide-react";
 
-export const SkillMetricsSection = ({ scores }) => {
+export const SkillMetricsSection = ({ scores = {} }) => {
   const data = [
-    { name: "Technical", score: scores.technical || 88 },
-    { name: "Relevance", score: scores.relevance || 92 },
-    { name: "Confidence", score: scores.confidence || 86 },
-    { name: "Communication", score: scores.communication || 85 },
-    { name: "Delivery", score: scores.video || 80 },
+    { name: "Technical", score: scores.technical ?? 0 },
+    { name: "Relevance", score: scores.relevance ?? 0 },
+    { name: "Confidence", score: scores.confidence ?? 0 },
+    { name: "Communication", score: scores.communication ?? 0 },
+    { name: "Delivery", score: scores.video && scores.video > 0 ? scores.video : (scores.audio_delivery ?? scores.video ?? 0) },
   ];
+
 
   return (
     <div className="card space-y-4" style={{ display: "flex", flexDirection: "column", justifyContent: "space-between" }}>

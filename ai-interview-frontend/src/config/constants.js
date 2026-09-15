@@ -5,7 +5,8 @@ export const INTERVIEW_MAX_SECONDS = 600;
 export const DEFAULT_MAX_QUESTIONS = 10;
 
 export const INTERVIEW_LANGUAGES = [
-  { code: "en-US", name: "English" },
+  { code: "en-IN", name: "English (India)" },
+  { code: "en-US", name: "English (US)" },
   { code: "hi-IN", name: "Hindi" },
   { code: "es-ES", name: "Spanish" },
   { code: "fr-FR", name: "French" },

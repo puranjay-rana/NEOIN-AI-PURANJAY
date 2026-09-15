@@ -18,8 +18,22 @@ export const TranscriptSection = ({
         </span>
       </div>
 
-      {/* Live Transcript Chat Stream */}
-      <div className="transcript-scroll-area" style={{ height: "260px", maxHeight: "260px", marginTop: "1rem" }}>
+      {/* Live Transcript Chat Stream (Selection & Copy Disabled) */}
+      <div 
+        className="transcript-scroll-area" 
+        style={{ 
+          height: "260px", 
+          maxHeight: "260px", 
+          marginTop: "1rem", 
+          userSelect: "none", 
+          WebkitUserSelect: "none", 
+          MozUserSelect: "none", 
+          msUserSelect: "none" 
+        }}
+        onCopy={(e) => e.preventDefault()}
+        onCut={(e) => e.preventDefault()}
+        onContextMenu={(e) => e.preventDefault()}
+      >
         {transcript.length === 0 ? (
           <div style={{ textAlign: "center", padding: "2.5rem 0", color: "#94a3b8", fontSize: "0.875rem", fontWeight: "500" }}>
             Live transcript responses will appear here in real-time as the interview progresses...

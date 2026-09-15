@@ -34,3 +34,6 @@ mediapipe
 deepface
 pdfplumber
 mysql-connector-python
+#audio 
+gTTS
+edge-tts 

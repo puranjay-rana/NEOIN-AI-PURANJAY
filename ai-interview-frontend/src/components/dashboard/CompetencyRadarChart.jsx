@@ -3,13 +3,13 @@ import { Radar, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Responsi
 import { Compass } from "lucide-react";
 import { Badge } from "../common/UIComponents";
 
-export const CompetencyRadarChart = ({ scores }) => {
+export const CompetencyRadarChart = ({ scores = {} }) => {
   const radarData = [
-    { subject: 'Technical', A: scores.technical || 88, fullMark: 100 },
-    { subject: 'Communication', A: scores.communication || 85, fullMark: 100 },
-    { subject: 'Relevance', A: scores.relevance || 92, fullMark: 100 },
-    { subject: 'Confidence', A: scores.confidence || 86, fullMark: 100 },
-    { subject: 'Delivery', A: scores.video || 80, fullMark: 100 },
+    { subject: 'Technical', A: scores.technical ?? 0, fullMark: 100 },
+    { subject: 'Communication', A: scores.communication ?? 0, fullMark: 100 },
+    { subject: 'Relevance', A: scores.relevance ?? 0, fullMark: 100 },
+    { subject: 'Confidence', A: scores.confidence ?? 0, fullMark: 100 },
+    { subject: 'Delivery', A: scores.video ?? 0, fullMark: 100 },
   ];
 
   return (

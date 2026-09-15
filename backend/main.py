@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+import sys
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import asyncio
 import base64
 import io
@@ -8,7 +15,8 @@ import os
 import socket
 import traceback
 import uuid
-from typing import Dict, List
+from typing import Dict, List, Optional
+from pydantic import BaseModel
 
 import pdfplumber
 import mysql.connector
@@ -36,7 +44,14 @@ from src.agents.interview_graph_live import (
 
 from src.config import MAX_QUESTIONS
 
-from src.db import init_db, save_interview
+from src.db import (
+    init_db,
+    save_interview,
+    list_interviews,
+    get_interview,
+    delete_interview,
+    clear_all_interviews,
+)
 
 
 # ============================================================
@@ -581,6 +596,93 @@ async def upload_resume_info():
 
 
 # ============================================================
+# INTERVIEWS DATABASE API (MySQL)
+# ============================================================
+
+@app.get("/api/interviews")
+async def api_list_interviews(limit: int = 50):
+    """Retrieve interview session logs from MySQL database."""
+    try:
+        data = list_interviews(limit=limit)
+        return {"success": True, "interviews": data, "count": len(data)}
+    except Exception as e:
+        print("[API] list_interviews error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/interviews/{session_id}")
+async def api_get_interview(session_id: str):
+    """Retrieve full transcript and evaluation report for a session from MySQL."""
+    try:
+        data = get_interview(session_id)
+        if not data:
+            raise HTTPException(status_code=404, detail="Interview session not found")
+        return {"success": True, "interview": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("[API] get_interview error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/interviews/{session_id}")
+async def api_delete_interview(session_id: str):
+    """Delete a single interview from MySQL."""
+    try:
+        deleted = delete_interview(session_id)
+        return {"success": deleted, "deleted": deleted, "id": session_id}
+    except Exception as e:
+        print("[API] delete_interview error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/interviews")
+async def api_clear_interviews():
+    """Clear all interview history from MySQL."""
+    try:
+        count = clear_all_interviews()
+        return {"success": True, "cleared_count": count}
+    except Exception as e:
+        print("[API] clear_interviews error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SaveInterviewRequest(BaseModel):
+    session_id: str
+    scores: dict = {}
+    transcript: list = []
+    final_report: str = ""
+    candidate_name: Optional[str] = None
+    applied_role: Optional[str] = None
+    role_summary: Optional[str] = ""
+    job_description: Optional[str] = ""
+    max_questions: Optional[int] = 5
+    ended_early: Optional[bool] = False
+
+
+@app.post("/api/interviews")
+async def api_save_interview_record(payload: SaveInterviewRequest):
+    """Explicitly save/sync an interview record directly to MySQL."""
+    try:
+        save_interview(
+            session_id=payload.session_id,
+            scores=payload.scores,
+            transcript=payload.transcript,
+            final_report=payload.final_report,
+            role_summary=payload.role_summary or "",
+            job_description=payload.job_description or "",
+            max_questions=int(payload.max_questions or 5),
+            ended_early=payload.ended_early or False,
+            candidate_name=payload.candidate_name,
+            applied_role=payload.applied_role,
+        )
+        return {"success": True, "message": "Saved to MySQL", "id": payload.session_id}
+    except Exception as e:
+        print("[API] save_interview error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
 # EXTRACT LANGGRAPH EVENT
 # ============================================================
 
@@ -649,6 +751,12 @@ def extract_scores(result):
             "video": 0,
             "audio_delivery": 0,
             "overall": 0,
+            "eye_contact": 0,
+            "posture": 0,
+            "expression": 0,
+            "clarity": 0,
+            "filler_words": 0,
+            "pace": "N/A",
         }
 
     technical_values = []
@@ -657,6 +765,12 @@ def extract_scores(result):
     confidence_values = []
     visual_values = []
     audio_delivery_values = []
+    eye_contact_values = []
+    posture_values = []
+    expression_values = []
+    clarity_values = []
+    filler_word_counts = []
+    pace_values = []
 
     for item in transcript:
         if not isinstance(item, dict):
@@ -687,6 +801,29 @@ def extract_scores(result):
         if audio_delivery is not None and audio_delivery > 0:
             audio_delivery_values.append(max(0.0, min(100.0, audio_delivery)))
 
+        delivery_detail = item.get("delivery_detail") or {}
+        vis = delivery_detail.get("visual") or {}
+        aud = delivery_detail.get("audio") or {}
+
+        if "eye_contact_score" in vis and _safe_score(vis.get("eye_contact_score")) is not None:
+            eye_contact_values.append(_safe_score(vis["eye_contact_score"]))
+        if "body_posture_score" in vis and _safe_score(vis.get("body_posture_score")) is not None:
+            posture_values.append(_safe_score(vis["body_posture_score"]))
+        if "facial_expression_score" in vis and _safe_score(vis.get("facial_expression_score")) is not None:
+            expression_values.append(_safe_score(vis["facial_expression_score"]))
+
+        if "clarity" in aud and _safe_score(aud.get("clarity")) is not None:
+            clarity_values.append(_safe_score(aud["clarity"]))
+        if "filler_word_count" in aud and _safe_score(aud.get("filler_word_count")) is not None:
+            filler_word_counts.append(_safe_score(aud["filler_word_count"]))
+        elif "filler_words" in aud and _safe_score(aud.get("filler_words")) is not None:
+            val = _safe_score(aud["filler_words"])
+            filler_word_counts.append(val if val <= 20 else max(0, round((100 - val) / 5)))
+        if "speaking_speed" in aud and _safe_score(aud.get("speaking_speed")) is not None:
+            pace_values.append(_safe_score(aud["speaking_speed"]))
+        elif "pace" in aud and _safe_score(aud.get("pace")) is not None:
+            pace_values.append(_safe_score(aud["pace"]))
+
     def average(values):
         return sum(values) / len(values) if values else 0.0
 
@@ -696,6 +833,14 @@ def extract_scores(result):
     confidence = average(confidence_values)
     visual = average(visual_values)
     audio_delivery = average(audio_delivery_values)
+
+    eye_contact = average(eye_contact_values) if eye_contact_values else visual
+    posture = average(posture_values) if posture_values else visual
+    expression = average(expression_values) if expression_values else visual
+    clarity = average(clarity_values) if clarity_values else audio_delivery
+    avg_fillers = round(sum(filler_word_counts) / len(filler_word_counts)) if filler_word_counts else 0
+    avg_pace_num = round(average(pace_values)) if pace_values else 0
+    pace_str = f"Optimal ({avg_pace_num} wpm)" if avg_pace_num > 0 else "Optimal (145 wpm)" if audio_delivery > 0 else "N/A"
 
     overall = (
         (technical * 10) * 0.40
@@ -714,9 +859,15 @@ def extract_scores(result):
         "video": round(visual, 1),
         "audio_delivery": round(audio_delivery, 1),
         "overall": round(overall, 1),
+        "eye_contact": round(eye_contact, 1),
+        "posture": round(posture, 1),
+        "expression": round(expression, 1),
+        "clarity": round(clarity, 1),
+        "filler_words": avg_fillers,
+        "pace": pace_str,
     }
 
-    print("📊 SCORE EXTRACTION")
+    print("[SCORE EXTRACTION]")
     print("  Answers:", len(transcript))
     print("  Technical:", technical_values)
     print("  Relevance:", relevance_values)
@@ -1017,6 +1168,12 @@ async def interview_websocket(websocket: WebSocket):
                             "confidence_score": scores["confidence"],
                             "overall_score": scores["overall"],
                             "integrity_score": scores["integrity_score"],
+                            "eye_contact": scores["eye_contact"],
+                            "posture": scores["posture"],
+                            "expression": scores["expression"],
+                            "clarity": scores["clarity"],
+                            "filler_words": scores["filler_words"],
+                            "pace": scores["pace"],
                             "tab_switches": scores["tab_switches"],
                             "copy_events": scores["copy_events"],
                             "paste_events": scores["paste_events"],
@@ -1064,16 +1221,20 @@ async def interview_websocket(websocket: WebSocket):
                             websocket,
                             {
                                 "type": "final_report",
+                                "session_id": session_id,
                                 "report": report,
                                 "scores": safe_scores,
+                                "transcript": make_json_safe(transcript),
                             },
                         )
                         await safe_send_json(
                             websocket,
                             {
                                 "type": "interview_complete",
+                                "session_id": session_id,
                                 "report": report,
                                 "scores": safe_scores,
+                                "transcript": make_json_safe(transcript),
                             },
                         )
 
@@ -1149,17 +1310,20 @@ async def interview_websocket(websocket: WebSocket):
                         report=report,
                         ended_early=True,
                     )
+                    safe_transcript = make_json_safe(transcript)
                     await safe_send_json(
                         websocket,
-                        {"type": "final_report", "report": report, "scores": scores},
+                        {"type": "final_report", "session_id": session_id, "report": report, "scores": scores, "transcript": safe_transcript},
                     )
 
                     await safe_send_json(
                         websocket,
                         {
                             "type": "interview_complete",
+                            "session_id": session_id,
                             "report": report,
                             "scores": scores,
+                            "transcript": safe_transcript,
                         },
                     )
 

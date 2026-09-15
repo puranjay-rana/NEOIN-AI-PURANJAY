@@ -42,9 +42,9 @@ class AudioAnalyzer:
             "right", "okay", "ok", "hmm", "mm", "uh-huh",
         }
 
-    def analyze_audio(self, audio_path: str) -> AudioMetrics:
+    def analyze_audio(self, audio_path: str, language: str = None, prompt: str = None) -> AudioMetrics:
         """Analyze audio file"""
-        transcript = "No transcription available"
+        transcript = ""  # Empty string = no transcript yet; callers check truthiness
         grammar_score = 50.0
         fluency_score = 50.0
         speaking_speed = 50.0
@@ -55,14 +55,32 @@ class AudioAnalyzer:
         # Transcribe with Whisper
         if self.whisper_available:
             try:
-                result = self.model.transcribe(audio_path )
-                transcript = result["text"]
-                print(f"Transcription: {transcript[:200]}...")
+                transcribe_kwargs = {
+                    "temperature": 0.0,
+                    "condition_on_previous_text": False,
+                    "fp16": False,
+                    "no_speech_threshold": 0.6,
+                    "logprob_threshold": -1.0,
+                    "compression_ratio_threshold": 2.0,
+                }
+                if language:
+                    transcribe_kwargs["language"] = language
+                if prompt:
+                    transcribe_kwargs["initial_prompt"] = prompt
+                else:
+                    transcribe_kwargs["initial_prompt"] = (
+                        "Technical candidate job interview discussing software development, coding, APIs, databases, "
+                        "Python, Node.js, Express, MongoDB, cloud services, and system architecture."
+                    )
+                result = self.model.transcribe(audio_path, **transcribe_kwargs)
+                raw = (result.get("text") or "").strip()
+                transcript = raw
+                print(f"[AudioAnalyzer] Whisper transcript ({len(transcript)} chars): {transcript[:200]!r}")
             except Exception as e:
-                print(f"Whisper transcription error: {e}")
+                print(f"[AudioAnalyzer] Whisper transcription error: {e}")
 
-        # If we have a transcript, analyze it
-        if transcript and transcript != "No transcription available":
+        # If we have a real transcript, analyze it
+        if transcript:
             try:
                 grammar_score = self._analyze_grammar(transcript) if self.spacy_available else 60.0
                 vocabulary_score = self._analyze_vocabulary(transcript)
